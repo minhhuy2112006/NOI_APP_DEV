@@ -1,0 +1,33 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {get,put,all,mutate,snapshot} from '../src/lib/demo-db';
+import {parseAction} from '../src/lib/validation';
+import {runMaintenance} from '../src/lib/maintenance';
+import {localDateTime,type User} from '../src/lib/domain';
+process.env.NOI_MODE='demo';process.env.NOI_TEST_DB=':memory:';
+test('changed schedule requires reconfirmation; reminders are idempotent; campaign closes after attendance window',()=>{
+ const user=get<User>('users','u-minh')!,org=get<User>('users','u-org')!;
+ const a=mutate(user,'apply',{campaign_id:'c1',motivation:'Đăng ký tham gia chiến dịch'});
+ mutate(org,'application',{id:a.id,status:'selected'});mutate(user,'application',{id:a.id,status:'confirmed'});
+ const c=get('campaigns','c1')!,start=new Date(Date.now()+3600000).toISOString(),end=new Date(Date.now()+5*3600000).toISOString();
+ const p=parseAction('campaign-schedule',{id:c.id,starts_at:start,ends_at:end,address:'Địa điểm mới',latitude:c.latitude,longitude:c.longitude,instructions:'Hãy xem lịch mới',reason:'Điều chỉnh theo địa điểm tổ chức'}) as Record<string,any>;
+ assert.throws(()=>mutate(user,'campaign-schedule',p));mutate(org,'campaign-schedule',p);
+ assert.equal(get('applications',a.id)!.status,'selected');assert.equal(snapshot(user).notifications.some(n=>n.title==='Chiến dịch thay đổi lịch'),true);
+ mutate(user,'application',{id:a.id,status:'confirmed'});assert.equal(runMaintenance().reminders,1);assert.equal(runMaintenance().reminders,0);
+ assert.equal(runMaintenance(Date.parse(start)+1000).transitions,1);assert.equal(get('campaigns',c.id)!.status,'active');
+ assert.equal(runMaintenance(Date.parse(end)+7200001).transitions,1);assert.equal(get('campaigns',c.id)!.status,'closed');
+ assert.throws(()=>mutate(org,'campaign-schedule',p));
+ assert.equal(localDateTime('2026-09-25T01:30:00.000Z'),'2026-09-25T08:30');
+});
+test('organization resubmission preserves identity and CMS routes cannot collide',()=>{
+ const user=get<User>('users','u-minh')!,admin=get<User>('users','u-admin')!;
+ const form={name:'Tổ chức thử nghiệm',description:'Thông tin tổ chức',contact:'team@example.com',evidence:'https://example.com/evidence'};
+ const o=mutate(user,'organization',form);mutate(admin,'organization-review',{id:o.id,status:'changes',reason:'Cần bổ sung minh chứng'});
+ const updated=get<User>('users',user.id)!;const resubmitted=mutate(updated,'organization',{...form,description:'Đã bổ sung hồ sơ'});
+ assert.equal(resubmitted.id,o.id);assert.equal(resubmitted.status,'pending');
+ assert.throws(()=>mutate(updated,'organization',form));
+ assert.throws(()=>mutate(admin,'content',{slug:'dang-nhap',title:'Không được ghi đè',body:'Không ghi đè đường dẫn đăng nhập'}));
+ const content=mutate(admin,'content',{slug:'tin-moi',title:'Bản tin',body:'Nội dung bản tin cộng đồng đủ dài.'});
+ assert.throws(()=>mutate(admin,'content',{slug:'tin-moi',title:'Bản khác',body:'Không được dùng trùng đường dẫn.'}));
+ assert.equal(snapshot(null).content.some(c=>c.id===content.id),false);
+});
